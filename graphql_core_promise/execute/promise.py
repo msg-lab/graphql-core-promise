@@ -443,7 +443,12 @@ class PromiseExecutionContext(ExecutionContext):
                     # and the whole list is nulled by the field above. Without the
                     # rejection handler the rejection surfaced at the list's path and
                     # nulled the whole list even for a nullable item type.
-                    return item.then(on_item_resolve).catch(on_error)
+                    try:
+                        return item.then(on_item_resolve).catch(on_error)
+                    except Exception as raw_error:
+                        # ``is_thenable`` also accepts coroutines and future-like
+                        # objects without a ``then``; keep that mistake at the item.
+                        return on_error(raw_error)
 
                 completed_item = await_completed(item, item_path)
             else:

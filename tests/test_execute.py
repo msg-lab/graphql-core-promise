@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 from unittest.mock import MagicMock, call
 
 from graphql.execution.execute import execute
@@ -394,6 +395,11 @@ def test_non_null_child_failure_under_promise_resolved_object_nulls_the_object()
 
 
 def test_sibling_errors_under_a_nulled_object_are_still_collected():
+    # Matches plain graphql-core in both field orders. Note that on graphql-core
+    # >= 3.2.10 ``CollectedErrors.add`` drops an error whose ancestor position is
+    # already nulled, so the ``optional`` error survives only because its own
+    # ``.catch`` runs before the one chained after ``Promise.all`` on ``child``;
+    # an extra link in either chain could flip this.
     child = GraphQLObjectType(
         "Child",
         {
@@ -465,6 +471,31 @@ def test_rejected_dataloader_item_in_list_nulls_only_that_item():
 
     assert result.data == {"items": ["item 1", None, "item 3"]}
     assert _errors(result) == [("no item 2", ["items", 1])]
+
+
+def test_thenable_item_without_then_nulls_only_that_item():
+    # ``promise.is_thenable`` accepts future-like objects that have no ``then``;
+    # the ``AttributeError`` belongs to the item, as ``await item`` would in
+    # graphql-core, not to the list.
+    future = Future()
+    future.set_result("y")
+    schema = GraphQLSchema(
+        GraphQLObjectType(
+            "Query",
+            {
+                "items": GraphQLField(
+                    GraphQLList(GraphQLString), resolve=lambda *_: ["x", future]
+                ),
+                "other": GraphQLField(GraphQLString, resolve=_resolve("o")),
+            },
+        )
+    )
+
+    result = _execute(schema, "{ items other }")
+
+    assert result.data == {"items": ["x", None], "other": "o"}
+    assert [error.path for error in result.errors] == [["items", 1]]
+    assert isinstance(result.errors[0].original_error, AttributeError)
 
 
 def test_rejected_non_null_item_nulls_the_list_and_keeps_the_item_path():
