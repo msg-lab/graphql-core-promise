@@ -1,3 +1,4 @@
+from concurrent.futures import Future
 from unittest.mock import MagicMock, call
 
 from graphql.execution.execute import execute
@@ -6,6 +7,7 @@ from graphql.type import (
     GraphQLArgument,
     GraphQLField,
     GraphQLID,
+    GraphQLNonNull,
     GraphQLObjectType,
     GraphQLSchema,
     GraphQLString,
@@ -333,3 +335,209 @@ def test_execute_list_results(benchmark):
         [call(["1 book_1", "2 book_1"]), call(["1 book_2", "2 book_2"])],
         any_order=True,
     )
+
+
+def _execute(schema, query):
+    result = execute(
+        schema=schema,
+        document=parse(query),
+        execution_context_class=PromiseExecutionContext,
+    )
+    assert not Promise.is_thenable(result), "promise execution must finish sync"
+    return result
+
+
+def _errors(result):
+    return sorted(
+        ((error.message, error.path) for error in result.errors or []),
+        key=lambda error: error[0],
+    )
+
+
+def _reject(message):
+    return lambda *_args, **_kwargs: Promise.reject(RuntimeError(message))
+
+
+def _resolve(value):
+    return lambda *_args, **_kwargs: Promise.resolve(value)
+
+
+# The expected values below are what plain graphql-core produces for the same
+# schemas with coroutines in place of promises (the spec's error-propagation
+# rules): an error nulls the nearest nullable ancestor and is located where it
+# occurred, never at the list or the root.
+
+
+def test_non_null_child_failure_under_promise_resolved_object_nulls_the_object():
+    child = GraphQLObjectType(
+        "Child",
+        {
+            "good": GraphQLField(GraphQLString, resolve=_resolve("g")),
+            "required": GraphQLField(
+                GraphQLNonNull(GraphQLString), resolve=_reject("required failed")
+            ),
+        },
+    )
+    schema = GraphQLSchema(
+        GraphQLObjectType(
+            "Query",
+            {
+                "child": GraphQLField(child, resolve=_resolve({})),
+                "other": GraphQLField(GraphQLString, resolve=_resolve("o")),
+            },
+        )
+    )
+
+    result = _execute(schema, "{ child { good required } other }")
+
+    assert result.data == {"child": None, "other": "o"}
+    assert _errors(result) == [("required failed", ["child", "required"])]
+
+
+def test_sibling_errors_under_a_nulled_object_are_still_collected():
+    # Matches plain graphql-core in both field orders. Note that on graphql-core
+    # >= 3.2.10 ``CollectedErrors.add`` drops an error whose ancestor position is
+    # already nulled, so the ``optional`` error survives only because its own
+    # ``.catch`` runs before the one chained after ``Promise.all`` on ``child``;
+    # an extra link in either chain could flip this.
+    child = GraphQLObjectType(
+        "Child",
+        {
+            "required": GraphQLField(
+                GraphQLNonNull(GraphQLString), resolve=_reject("required failed")
+            ),
+            "optional": GraphQLField(GraphQLString, resolve=_reject("optional failed")),
+        },
+    )
+    schema = GraphQLSchema(
+        GraphQLObjectType("Query", {"child": GraphQLField(child, resolve=_resolve({}))})
+    )
+
+    result = _execute(schema, "{ child { required optional } }")
+
+    assert result.data == {"child": None}
+    assert _errors(result) == [
+        ("optional failed", ["child", "optional"]),
+        ("required failed", ["child", "required"]),
+    ]
+
+
+def test_rejected_item_in_list_nulls_only_that_item():
+    schema = GraphQLSchema(
+        GraphQLObjectType(
+            "Query",
+            {
+                "items": GraphQLField(
+                    GraphQLList(GraphQLString),
+                    resolve=lambda *_: [
+                        Promise.resolve("x"),
+                        Promise.reject(RuntimeError("item failed")),
+                        "z",
+                    ],
+                ),
+                "other": GraphQLField(GraphQLString, resolve=_resolve("o")),
+            },
+        )
+    )
+
+    result = _execute(schema, "{ items other }")
+
+    assert result.data == {"items": ["x", None, "z"], "other": "o"}
+    assert _errors(result) == [("item failed", ["items", 1])]
+
+
+def test_rejected_dataloader_item_in_list_nulls_only_that_item():
+    class ItemLoader(DataLoader):
+        def batch_load_fn(self, keys):
+            return Promise.resolve([
+                RuntimeError(f"no item {key}") if key == "2" else f"item {key}"
+                for key in keys
+            ])
+
+    loader = ItemLoader()
+    schema = GraphQLSchema(
+        GraphQLObjectType(
+            "Query",
+            {
+                "items": GraphQLField(
+                    GraphQLList(GraphQLString),
+                    resolve=lambda *_: [loader.load(key) for key in ("1", "2", "3")],
+                )
+            },
+        )
+    )
+
+    result = _execute(schema, "{ items }")
+
+    assert result.data == {"items": ["item 1", None, "item 3"]}
+    assert _errors(result) == [("no item 2", ["items", 1])]
+
+
+def test_thenable_item_without_then_nulls_only_that_item():
+    # ``promise.is_thenable`` accepts future-like objects that have no ``then``;
+    # the ``AttributeError`` belongs to the item, as ``await item`` would in
+    # graphql-core, not to the list.
+    future = Future()
+    future.set_result("y")
+    schema = GraphQLSchema(
+        GraphQLObjectType(
+            "Query",
+            {
+                "items": GraphQLField(
+                    GraphQLList(GraphQLString), resolve=lambda *_: ["x", future]
+                ),
+                "other": GraphQLField(GraphQLString, resolve=_resolve("o")),
+            },
+        )
+    )
+
+    result = _execute(schema, "{ items other }")
+
+    assert result.data == {"items": ["x", None], "other": "o"}
+    assert [error.path for error in result.errors] == [["items", 1]]
+    assert isinstance(result.errors[0].original_error, AttributeError)
+
+
+def test_rejected_non_null_item_nulls_the_list_and_keeps_the_item_path():
+    schema = GraphQLSchema(
+        GraphQLObjectType(
+            "Query",
+            {
+                "items": GraphQLField(
+                    GraphQLList(GraphQLNonNull(GraphQLString)),
+                    resolve=lambda *_: [
+                        Promise.resolve("x"),
+                        Promise.reject(RuntimeError("item failed")),
+                    ],
+                ),
+                "other": GraphQLField(GraphQLString, resolve=_resolve("o")),
+            },
+        )
+    )
+
+    result = _execute(schema, "{ items other }")
+
+    assert result.data == {"items": None, "other": "o"}
+    assert _errors(result) == [("item failed", ["items", 1])]
+
+
+def test_completion_error_on_a_resolved_promise_is_located_at_the_field():
+    schema = GraphQLSchema(
+        GraphQLObjectType(
+            "Query",
+            {
+                "items": GraphQLField(GraphQLList(GraphQLString), resolve=_resolve(42)),
+                "other": GraphQLField(GraphQLString, resolve=_resolve("o")),
+            },
+        )
+    )
+
+    result = _execute(schema, "{ items other }")
+
+    assert result.data == {"items": None, "other": "o"}
+    assert _errors(result) == [
+        (
+            "Expected Iterable, but did not find one for field 'Query.items'.",
+            ["items"],
+        )
+    ]
