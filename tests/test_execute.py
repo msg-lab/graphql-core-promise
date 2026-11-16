@@ -184,8 +184,10 @@ def test_execute_mutation():
         None,
     )
 
-    author_load_stub.assert_called_once_with(["3", "4"])
-    name_loader_stub.assert_called_once_with(["3", "4"])
+    # Mutation fields run serially: ``b`` is resolved only after ``a`` and its
+    # sub-selections have completed, so the loaders cannot batch across them.
+    assert author_load_stub.call_args_list == [call(["3"]), call(["4"])]
+    assert name_loader_stub.call_args_list == [call(["3"]), call(["4"])]
 
 
 def test_handles_rejected_promise_field_error():
@@ -541,3 +543,143 @@ def test_completion_error_on_a_resolved_promise_is_located_at_the_field():
             ["items"],
         )
     ]
+
+
+# Mutation root fields: the expected values are again what plain graphql-core
+# produces with coroutines, plus graphql-js's guarantee that a field's resolver
+# is not called before the previous field has completed.
+
+
+def _mutation_schema(fields):
+    return GraphQLSchema(
+        GraphQLObjectType("Query", {"unused": GraphQLField(GraphQLString)}),
+        GraphQLObjectType("Mutation", fields),
+    )
+
+
+def _recorded(order, name, resolve):
+    def resolver(*args, **kwargs):
+        order.append(("resolve", name))
+        return resolve(*args, **kwargs)
+
+    return resolver
+
+
+def test_mutation_fields_resolve_one_at_a_time():
+    order = []
+
+    class RecordingLoader(DataLoader):
+        def batch_load_fn(self, keys):
+            order.append(("batch", tuple(keys)))
+            return Promise.resolve(list(keys))
+
+    loader = RecordingLoader()
+    schema = _mutation_schema({
+        "a": GraphQLField(GraphQLString, resolve=_recorded(order, "a", _resolve("a"))),
+        "b": GraphQLField(
+            GraphQLString, resolve=_recorded(order, "b", lambda *_: loader.load("b"))
+        ),
+        "c": GraphQLField(
+            GraphQLString, resolve=_recorded(order, "c", lambda *_: loader.load("c"))
+        ),
+    })
+
+    result = _execute(schema, "mutation { a b c }")
+
+    assert result.data == {"a": "a", "b": "b", "c": "c"}
+    assert result.errors is None
+    assert list(result.data) == ["a", "b", "c"]
+    assert order == [
+        ("resolve", "a"),
+        ("resolve", "b"),
+        ("batch", ("b",)),
+        ("resolve", "c"),
+        ("batch", ("c",)),
+    ]
+
+
+def test_rejected_non_null_mutation_field_after_a_promise_nulls_the_data():
+    order = []
+    schema = _mutation_schema({
+        "a": GraphQLField(GraphQLString, resolve=_recorded(order, "a", _resolve("a"))),
+        "b": GraphQLField(GraphQLString, resolve=_recorded(order, "b", _resolve("b"))),
+        "d": GraphQLField(
+            GraphQLNonNull(GraphQLString),
+            resolve=_recorded(order, "d", _reject("d failed")),
+        ),
+        "e": GraphQLField(GraphQLString, resolve=_recorded(order, "e", _resolve("e"))),
+    })
+
+    result = _execute(schema, "mutation { a b d e }")
+
+    assert result.data is None
+    assert _errors(result) == [("d failed", ["d"])]
+    # A failed non-null mutation field stops the later ones from running.
+    assert order == [("resolve", "a"), ("resolve", "b"), ("resolve", "d")]
+
+
+def test_raising_non_null_mutation_field_after_a_promise_nulls_the_data():
+    def fail(*_args):
+        msg = "d raised"
+        raise RuntimeError(msg)
+
+    schema = _mutation_schema({
+        "a": GraphQLField(GraphQLString, resolve=_resolve("a")),
+        "d": GraphQLField(GraphQLNonNull(GraphQLString), resolve=fail),
+    })
+
+    result = _execute(schema, "mutation { a d }")
+
+    assert result.data is None
+    assert _errors(result) == [("d raised", ["d"])]
+
+
+def test_rejected_non_null_first_mutation_field_skips_the_rest():
+    order = []
+    schema = _mutation_schema({
+        "a": GraphQLField(
+            GraphQLNonNull(GraphQLString),
+            resolve=_recorded(order, "a", _reject("a failed")),
+        ),
+        "b": GraphQLField(GraphQLString, resolve=_recorded(order, "b", _resolve("b"))),
+    })
+
+    result = _execute(schema, "mutation { a b }")
+
+    assert result.data is None
+    assert _errors(result) == [("a failed", ["a"])]
+    assert order == [("resolve", "a")]
+
+
+def test_rejected_nullable_mutation_field_after_a_promise_is_located_at_the_field():
+    schema = _mutation_schema({
+        "a": GraphQLField(GraphQLString, resolve=_resolve("a")),
+        "b": GraphQLField(GraphQLString, resolve=_reject("b failed")),
+        "c": GraphQLField(GraphQLString, resolve=_resolve("c")),
+    })
+
+    result = _execute(schema, "mutation { a b c }")
+
+    assert result.data == {"a": "a", "b": None, "c": "c"}
+    assert _errors(result) == [("b failed", ["b"])]
+
+
+def test_non_null_child_failure_in_a_later_mutation_payload_nulls_that_payload():
+    payload = GraphQLObjectType(
+        "Payload",
+        {
+            "required": GraphQLField(
+                GraphQLNonNull(GraphQLString), resolve=_reject("required failed")
+            ),
+        },
+    )
+    schema = _mutation_schema({
+        "a": GraphQLField(GraphQLString, resolve=_resolve("a")),
+        "b": GraphQLField(payload, resolve=_resolve({})),
+        "c": GraphQLField(GraphQLString, resolve=_resolve("c")),
+    })
+
+    result = _execute(schema, "mutation { a b { required } c }")
+
+    assert result.data == {"a": "a", "b": None, "c": "c"}
+    assert _errors(result) == [("required failed", ["b", "required"])]

@@ -114,57 +114,57 @@ class PromiseExecutionContext(ExecutionContext):
         path: Path | None,
         fields: dict[str, list[FieldNode]],
     ) -> PromiseOrValue[dict[str, Any]]:
-        results: PromiseOrValue[dict[str, Any]] = {}
+        """Execute the given fields serially (the mutation root).
+
+        Once a field has returned a promise, the next field is executed inside
+        that promise's ``then`` callback, so no resolver runs before the previous
+        field (its sub-selections included) has completed, as the spec requires
+        for mutations, and the chained promise is the one returned. A rejection
+        has already been located at its field by ``execute_field``, which also
+        re-raises it for a non-null field; the chain then rejects, the later
+        fields are never executed, and ``execute`` records the error with
+        ``data`` nulled -- what graphql-core does for awaitables, where awaiting
+        the previous results raises.
+        """
         is_promise = self.is_promise
-        for response_name, field_nodes in fields.items():
+
+        def execute_one(
+            results: dict[str, Any],
+            response_name: str,
+            field_nodes: list[FieldNode],
+        ) -> PromiseOrValue[dict[str, Any]]:
             field_path = Path(path, response_name, parent_type.name)
             result = self.execute_field(
                 parent_type, source_value, field_nodes, field_path
             )
             if result is Undefined:
-                continue
-            if is_promise(results):
-                # noinspection PyShadowingNames
-                def await_and_set_result(
-                    results: Promise[dict[str, Any]],
-                    response_name: str,
-                    result: PromiseOrValue[Any],
-                ) -> Promise[dict[str, Any]]:
-                    def handle_results(resolved_results):
-                        if is_promise(result):
+                return results
+            if is_promise(result):
 
-                            def on_resolve(v):
-                                resolved_results[response_name] = v
-                                return resolved_results
-
-                            return result.then(on_resolve)
-                        resolved_results[response_name] = result
-                        return resolved_results
-
-                    results.then(handle_results)
+                def on_resolve(resolved: Any) -> dict[str, Any]:
+                    results[response_name] = resolved
                     return results
 
-                results = await_and_set_result(
-                    cast(Promise, results), response_name, result
-                )
-            elif is_promise(result):
+                return cast(Promise, result).then(on_resolve)
+            results[response_name] = result
+            return results
+
+        results: PromiseOrValue[dict[str, Any]] = {}
+        for response_name, field_nodes in fields.items():
+            if is_promise(results):
                 # noinspection PyShadowingNames
-                def set_result(
-                    results: dict[str, Any],
-                    response_name: str,
-                    result: Promise,
-                ) -> Promise[dict[str, Any]]:
-                    def on_resolve(v):
-                        results[response_name] = v
-                        return results
+                def execute_next(
+                    resolved_results: dict[str, Any],
+                    response_name: str = response_name,
+                    field_nodes: list[FieldNode] = field_nodes,
+                ) -> PromiseOrValue[dict[str, Any]]:
+                    return execute_one(resolved_results, response_name, field_nodes)
 
-                    return result.then(on_resolve)
-
-                results = set_result(
-                    cast(dict[str, Any], results), response_name, result
-                )
+                results = cast(Promise, results).then(execute_next)
             else:
-                cast(dict[str, Any], results)[response_name] = result
+                results = execute_one(
+                    cast(dict[str, Any], results), response_name, field_nodes
+                )
         return results
 
     def execute_field(
