@@ -130,8 +130,8 @@ class PromiseExecutionContext(ExecutionContext):
         be awaited, but not for a promise-returning resolver, which runs now).
         A consequence, also as in graphql-js: a request-scoped DataLoader cache
         filled by an earlier field's payload is what a later field's payload
-        reads, so a mutation whose payload must show its own write clears or
-        primes that loader key.
+        reads, from before the later write, unless the caller gives each root
+        field fresh loaders (or the mutation clears or primes the keys it writes).
         """
         is_promise = self.is_promise
 
