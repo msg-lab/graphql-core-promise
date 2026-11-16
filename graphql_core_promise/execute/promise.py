@@ -123,8 +123,15 @@ class PromiseExecutionContext(ExecutionContext):
         has already been located at its field by ``execute_field``, which also
         re-raises it for a non-null field; the chain then rejects, the later
         fields are never executed, and ``execute`` records the error with
-        ``data`` nulled -- what graphql-core does for awaitables, where awaiting
-        the previous results raises.
+        ``data`` nulled -- the same response graphql-core gives for awaitables,
+        where awaiting the previous results raises. The resolver order follows
+        graphql-js rather than graphql-core 3.2, which calls every later
+        resolver before awaiting (harmless for coroutines, whose bodies wait to
+        be awaited, but not for a promise-returning resolver, which runs now).
+        A consequence, also as in graphql-js: a request-scoped DataLoader cache
+        filled by an earlier field's payload is what a later field's payload
+        reads, so a mutation whose payload must show its own write clears or
+        primes that loader key.
         """
         is_promise = self.is_promise
 

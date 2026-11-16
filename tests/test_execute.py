@@ -683,3 +683,28 @@ def test_non_null_child_failure_in_a_later_mutation_payload_nulls_that_payload()
 
     assert result.data == {"a": "a", "b": None, "c": "c"}
     assert _errors(result) == [("required failed", ["b", "required"])]
+
+
+def test_non_null_child_failure_in_a_later_non_null_payload_nulls_the_data():
+    order = []
+    payload = GraphQLObjectType(
+        "Payload",
+        {
+            "required": GraphQLField(
+                GraphQLNonNull(GraphQLString), resolve=_reject("required failed")
+            ),
+        },
+    )
+    schema = _mutation_schema({
+        "a": GraphQLField(GraphQLString, resolve=_recorded(order, "a", _resolve("a"))),
+        "b": GraphQLField(
+            GraphQLNonNull(payload), resolve=_recorded(order, "b", _resolve({}))
+        ),
+        "c": GraphQLField(GraphQLString, resolve=_recorded(order, "c", _resolve("c"))),
+    })
+
+    result = _execute(schema, "mutation { a b { required } c }")
+
+    assert result.data is None
+    assert _errors(result) == [("required failed", ["b", "required"])]
+    assert order == [("resolve", "a"), ("resolve", "b")]
