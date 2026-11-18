@@ -131,7 +131,9 @@ class PromiseExecutionContext(ExecutionContext):
         A consequence, also as in graphql-js: a request-scoped DataLoader cache
         filled by an earlier field's payload is what a later field's payload
         reads, from before the later write, unless the caller gives each root
-        field fresh loaders (or the mutation clears or primes the keys it writes).
+        field fresh loaders, or the mutation clears the keys it writes (or clears
+        them and then primes them with the new values: ``prime`` alone leaves a
+        key that is already cached unchanged).
         """
         is_promise = self.is_promise
 
