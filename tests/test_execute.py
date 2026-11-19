@@ -16,6 +16,7 @@ from graphql.type import (
 from graphql.type.definition import GraphQLList
 from promise import Promise
 from promise.dataloader import DataLoader
+from promise.promise import async_instance
 
 from graphql_core_promise.execute import PromiseExecutionContext
 
@@ -721,13 +722,20 @@ def test_non_null_child_failure_in_a_later_non_null_payload_nulls_the_data():
 LONG_ROOT_COUNT = 1000
 
 
-def _execute_bounded(schema, query, timeout=30):
-    """Run ``_execute`` in a thread so a response left pending fails the test."""
+def _execute_bounded(schema, query, timeout=30, around=None):
+    """Run ``_execute`` in a thread so a response left pending fails the test.
+
+    ``around``, if given, is called in that thread with the execution as a
+    zero-argument callable and returns its result.
+    """
     outcome = {}
+
+    def execution():
+        return _execute(schema, query)
 
     def run():
         try:
-            outcome["result"] = _execute(schema, query)
+            outcome["result"] = execution() if around is None else around(execution)
         except BaseException as error:
             outcome["error"] = error
 
@@ -876,3 +884,57 @@ def test_many_batched_payload_root_fields_resolve_in_document_order():
     }
     # One batch per root field, in document order: no field ran early.
     assert order == [(f"{i}.x", f"{i}.y") for i in range(LONG_ROOT_COUNT)]
+
+
+def test_many_promise_root_fields_inside_a_running_tick_resolve_in_linear_time():
+    # Executed from a promise callback, the walk runs inside a trampoline tick
+    # that is already in use, and ``get`` drains the queue one callback at a
+    # time, resolving the returned promise before each. A walk that returned a
+    # promise per pass built a chain of promises following one another, walked
+    # before every callback: quadratic, about 12 s for 5,000 roots and about
+    # four times that for the 10,000 here, against well under a second now.
+    schema = _mutation_schema({
+        "settled": GraphQLField(GraphQLString, resolve=_resolve("settled")),
+    })
+    count = 10 * LONG_ROOT_COUNT
+    query = "mutation { " + _aliases("s", "settled", count) + " }"
+
+    result = _execute_bounded(
+        schema,
+        query,
+        timeout=10,
+        around=lambda execution: (
+            Promise.resolve(None).then(lambda _: execution()).get()
+        ),
+    )
+
+    assert result.errors is None
+    assert list(result.data) == [f"s{i}" for i in range(count)]
+
+
+def test_many_loader_root_fields_with_the_trampoline_off_all_resolve():
+    # With the trampoline off every callback runs at once, so a field's
+    # promise has often settled before ``execute_field`` returns it. Continuing
+    # the walk from that promise's callback nested one pass per field.
+    class EchoLoader(DataLoader):
+        def batch_load_fn(self, keys):
+            return Promise.resolve(list(keys))
+
+    loader = EchoLoader()
+    schema = _mutation_schema({
+        "loaded": GraphQLField(GraphQLString, resolve=lambda *_: loader.load("loaded")),
+    })
+    query = "mutation { " + _aliases("l", "loaded") + " }"
+
+    def without_trampoline(execution):
+        # ``async_instance`` is thread-local: this only affects the test thread.
+        async_instance.disable_trampoline()
+        try:
+            return execution()
+        finally:
+            async_instance.enable_trampoline()
+
+    result = _execute_bounded(schema, query, around=without_trampoline)
+
+    assert result.errors is None
+    assert list(result.data) == [f"l{i}" for i in range(LONG_ROOT_COUNT)]

@@ -116,12 +116,12 @@ class PromiseExecutionContext(ExecutionContext):
     ) -> PromiseOrValue[dict[str, Any]]:
         """Execute the given fields serially (the mutation root).
 
-        Once a field has returned a promise, the next field is executed inside
-        that promise's ``then`` callback, so no resolver runs before the previous
+        Once a field has returned a promise, the next field is executed only
+        after that promise has settled, so no resolver runs before the previous
         field (its sub-selections included) has completed, as the spec requires
-        for mutations, and the chained promise is the one returned. A rejection
+        for mutations, and a promise for the whole walk is returned. A rejection
         has already been located at its field by ``execute_field``, which also
-        re-raises it for a non-null field; the chain then rejects, the later
+        re-raises it for a non-null field; the walk then rejects, the later
         fields are never executed, and ``execute`` records the error with
         ``data`` nulled -- the same response graphql-core gives for awaitables,
         where awaiting the previous results raises. The resolver order follows
@@ -142,17 +142,31 @@ class PromiseExecutionContext(ExecutionContext):
         previous one nested each plain-valued field inside the previous one's
         callback whenever the chain descended from a ``Promise.all`` (whose
         promises settle their callbacks synchronously and hand that on), about
-        six frames per field: a few hundred plain root fields after a payload
-        with two loader-backed fields overflowed the stack, and the
-        ``RecursionError``, swallowed by promise's scheduler, left the response
-        pending for good.
+        six frames per field: about 160 plain root fields after a payload with
+        two loader-backed fields overflowed the stack (at Python's default
+        recursion limit), and the ``RecursionError``, swallowed by promise's
+        scheduler, left the response pending for good.
+
+        A promise that has already settled is read in the loop as well, and
+        every pass settles the one promise returned for the whole walk rather
+        than returning a promise of its own, so neither the stack nor a chain of
+        promises following one another grows with the number of fields (such a
+        chain is walked before each queued callback when the walk runs inside
+        a tick that is already in use, which made it quadratic).
         """
         is_promise = self.is_promise
         field_items = list(fields.items())
         field_count = len(field_items)
         results: dict[str, Any] = {}
+        # Settled once, after the last field, if any field has to be waited for.
+        walk = Promise()
 
-        def execute_from(index: int) -> PromiseOrValue[dict[str, Any]]:
+        def execute_from(index: int) -> bool:
+            """Execute fields from ``index`` on; return whether one is pending.
+
+            A pending field's settlement continues the walk; a rejected field
+            (a non-null error, already located by ``execute_field``) raises.
+            """
             while index < field_count:
                 response_name, field_nodes = field_items[index]
                 index += 1
@@ -163,27 +177,38 @@ class PromiseExecutionContext(ExecutionContext):
                 if result is Undefined:
                     continue
                 if is_promise(result):
+                    result = Promise.resolve(result)
+                    if not result.is_pending:
+                        results[response_name] = result.get()
+                        continue
+
                     # noinspection PyShadowingNames
                     def on_resolve(
                         resolved: Any,
                         response_name: str = response_name,
                         next_index: int = index,
-                    ) -> PromiseOrValue[dict[str, Any]]:
+                    ) -> None:
                         results[response_name] = resolved
-                        if next_index == field_count:
-                            return results
                         # ``then`` on a settled promise that is not async-
                         # guaranteed goes through the trampoline queue, so the
                         # next pass starts on a flat stack.
-                        return Promise.resolve(None).then(
-                            lambda _: execute_from(next_index)
-                        )
+                        Promise.resolve(None).then(lambda _: continue_from(next_index))
 
-                    return cast(Promise, result).then(on_resolve)
+                    result.then(on_resolve, walk.do_reject)
+                    return True
                 results[response_name] = result
-            return results
+            return False
 
-        return execute_from(0)
+        def continue_from(index: int) -> None:
+            try:
+                pending = execute_from(index)
+            except Exception as error:
+                walk.do_reject(error)
+                return
+            if not pending:
+                walk.do_resolve(results)
+
+        return walk if execute_from(0) else results
 
     def execute_field(
         self,
