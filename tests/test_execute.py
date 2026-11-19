@@ -1,3 +1,4 @@
+import threading
 from concurrent.futures import Future
 from unittest.mock import MagicMock, call
 
@@ -15,6 +16,7 @@ from graphql.type import (
 from graphql.type.definition import GraphQLList
 from promise import Promise
 from promise.dataloader import DataLoader
+from promise.promise import async_instance
 
 from graphql_core_promise.execute import PromiseExecutionContext
 
@@ -708,3 +710,231 @@ def test_non_null_child_failure_in_a_later_non_null_payload_nulls_the_data():
     assert result.data is None
     assert _errors(result) == [("required failed", ["b", "required"])]
     assert order == [("resolve", "a"), ("resolve", "b")]
+
+
+# A payload whose sub-fields are two loader-backed promises completes through
+# ``Promise.all``, whose promises settle their callbacks synchronously and pass
+# that on down the chain. Followed by many root fields that complete without a
+# promise, a chain built up front nested each of them inside the previous one
+# and overflowed the stack after about 160 fields, and the swallowed
+# ``RecursionError`` left the response pending for good.
+
+LONG_ROOT_COUNT = 1000
+
+
+def _execute_bounded(schema, query, timeout=30, around=None):
+    """Run ``_execute`` in a thread so a response left pending fails the test.
+
+    ``around``, if given, is called in that thread with the execution as a
+    zero-argument callable and returns its result.
+    """
+    outcome = {}
+
+    def execution():
+        return _execute(schema, query)
+
+    def run():
+        try:
+            outcome["result"] = execution() if around is None else around(execution)
+        except BaseException as error:
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), "the mutation never returned"
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["result"]
+
+
+def _batched_payload_schema(extra_fields):
+    class EchoLoader(DataLoader):
+        def batch_load_fn(self, keys):
+            return Promise.resolve(list(keys))
+
+    loader = EchoLoader()
+    payload = GraphQLObjectType(
+        "Payload",
+        {
+            "x": GraphQLField(GraphQLString, resolve=lambda *_: loader.load("x")),
+            "y": GraphQLField(GraphQLString, resolve=lambda *_: loader.load("y")),
+        },
+    )
+    return _mutation_schema({
+        "a": GraphQLField(payload, resolve=lambda *_: object()),
+        **extra_fields,
+    })
+
+
+def _aliases(prefix, selection, count=LONG_ROOT_COUNT):
+    return " ".join(f"{prefix}{i}: {selection}" for i in range(count))
+
+
+def test_many_plain_root_fields_after_a_batched_payload_all_resolve():
+    schema = _batched_payload_schema({
+        "plain": GraphQLField(GraphQLString, resolve=lambda *_: "plain"),
+    })
+    query = (
+        "mutation { a { x y } "
+        + _aliases("t", "__typename")
+        + " "
+        + _aliases("p", "plain")
+        + " }"
+    )
+
+    result = _execute_bounded(schema, query)
+
+    assert result.errors is None
+    expected_keys = (
+        ["a"]
+        + [f"t{i}" for i in range(LONG_ROOT_COUNT)]
+        + [f"p{i}" for i in range(LONG_ROOT_COUNT)]
+    )
+    assert list(result.data) == expected_keys
+    assert result.data["a"] == {"x": "x", "y": "y"}
+    assert result.data[f"t{LONG_ROOT_COUNT - 1}"] == "Mutation"
+    assert result.data[f"p{LONG_ROOT_COUNT - 1}"] == "plain"
+
+
+def test_many_raising_nullable_root_fields_after_a_batched_payload_are_located():
+    def fail(*_args):
+        msg = "nullable failed"
+        raise RuntimeError(msg)
+
+    schema = _batched_payload_schema({
+        "fail": GraphQLField(GraphQLString, resolve=fail),
+        "last": GraphQLField(GraphQLString, resolve=lambda *_: "last"),
+    })
+    query = "mutation { a { x y } " + _aliases("f", "fail") + " last }"
+
+    result = _execute_bounded(schema, query)
+
+    assert len(result.data) == LONG_ROOT_COUNT + 2
+    assert result.data["last"] == "last"
+    assert result.data["f0"] is None
+    assert len(result.errors) == LONG_ROOT_COUNT
+    assert sorted(error.path[0] for error in result.errors) == sorted(
+        f"f{i}" for i in range(LONG_ROOT_COUNT)
+    )
+
+
+def test_raising_non_null_root_after_many_plain_root_fields_nulls_the_data():
+    order = []
+
+    def fail(*_args):
+        msg = "required failed"
+        raise RuntimeError(msg)
+
+    schema = _batched_payload_schema({
+        "required": GraphQLField(GraphQLNonNull(GraphQLString), resolve=fail),
+        "after": GraphQLField(
+            GraphQLString, resolve=_recorded(order, "after", lambda *_: "after")
+        ),
+    })
+    query = "mutation { a { x y } " + _aliases("t", "__typename") + " required after }"
+
+    result = _execute_bounded(schema, query)
+
+    assert result.data is None
+    assert _errors(result) == [("required failed", ["required"])]
+    assert order == []
+
+
+def test_many_batched_payload_root_fields_resolve_in_document_order():
+    order = []
+
+    class RecordingLoader(DataLoader):
+        def batch_load_fn(self, keys):
+            order.append(tuple(keys))
+            return Promise.resolve(list(keys))
+
+    loader = RecordingLoader()
+    payload = GraphQLObjectType(
+        "Payload",
+        {
+            "x": GraphQLField(
+                GraphQLString, resolve=lambda obj, _info: loader.load(f"{obj}.x")
+            ),
+            "y": GraphQLField(
+                GraphQLString, resolve=lambda obj, _info: loader.load(f"{obj}.y")
+            ),
+        },
+    )
+    schema = _mutation_schema({
+        "a": GraphQLField(
+            payload,
+            args={"n": GraphQLArgument(GraphQLString)},
+            resolve=lambda _obj, _info, n: Promise.resolve(n),
+        ),
+    })
+    query = (
+        "mutation { "
+        + " ".join(f'a{i}: a(n: "{i}") {{ x y }}' for i in range(LONG_ROOT_COUNT))
+        + " }"
+    )
+
+    result = _execute_bounded(schema, query)
+
+    assert result.errors is None
+    assert list(result.data) == [f"a{i}" for i in range(LONG_ROOT_COUNT)]
+    assert result.data[f"a{LONG_ROOT_COUNT - 1}"] == {
+        "x": f"{LONG_ROOT_COUNT - 1}.x",
+        "y": f"{LONG_ROOT_COUNT - 1}.y",
+    }
+    # One batch per root field, in document order: no field ran early.
+    assert order == [(f"{i}.x", f"{i}.y") for i in range(LONG_ROOT_COUNT)]
+
+
+def test_many_promise_root_fields_inside_a_running_tick_resolve_in_linear_time():
+    # Executed from a promise callback, the walk runs inside a trampoline tick
+    # that is already in use, and ``get`` drains the queue one callback at a
+    # time, resolving the returned promise before each. A walk that returned a
+    # promise per pass built a chain of promises following one another, walked
+    # before every callback: quadratic, about 12 s for 5,000 roots and about
+    # four times that for the 10,000 here, against well under a second now.
+    schema = _mutation_schema({
+        "settled": GraphQLField(GraphQLString, resolve=_resolve("settled")),
+    })
+    count = 10 * LONG_ROOT_COUNT
+    query = "mutation { " + _aliases("s", "settled", count) + " }"
+
+    result = _execute_bounded(
+        schema,
+        query,
+        timeout=10,
+        around=lambda execution: (
+            Promise.resolve(None).then(lambda _: execution()).get()
+        ),
+    )
+
+    assert result.errors is None
+    assert list(result.data) == [f"s{i}" for i in range(count)]
+
+
+def test_many_loader_root_fields_with_the_trampoline_off_all_resolve():
+    # With the trampoline off every callback runs at once, so a field's
+    # promise has often settled before ``execute_field`` returns it. Continuing
+    # the walk from that promise's callback nested one pass per field.
+    class EchoLoader(DataLoader):
+        def batch_load_fn(self, keys):
+            return Promise.resolve(list(keys))
+
+    loader = EchoLoader()
+    schema = _mutation_schema({
+        "loaded": GraphQLField(GraphQLString, resolve=lambda *_: loader.load("loaded")),
+    })
+    query = "mutation { " + _aliases("l", "loaded") + " }"
+
+    def without_trampoline(execution):
+        # ``async_instance`` is thread-local: this only affects the test thread.
+        async_instance.disable_trampoline()
+        try:
+            return execution()
+        finally:
+            async_instance.enable_trampoline()
+
+    result = _execute_bounded(schema, query, around=without_trampoline)
+
+    assert result.errors is None
+    assert list(result.data) == [f"l{i}" for i in range(LONG_ROOT_COUNT)]
