@@ -189,21 +189,27 @@ class PromiseExecutionContext(ExecutionContext):
                         next_index: int = index,
                     ) -> None:
                         results[response_name] = resolved
-                        # ``then`` on a settled promise that is not async-
-                        # guaranteed goes through the trampoline queue, so the
-                        # next pass starts on a flat stack.
+                        # With the trampoline on, ``then`` on a settled promise
+                        # that is not async-guaranteed goes through its queue,
+                        # so the next pass starts on a flat stack. (With it off
+                        # the pass runs here, but a promise still pending at
+                        # this point was settled from outside the walk.)
                         Promise.resolve(None).then(lambda _: continue_from(next_index))
 
-                    result.then(on_resolve, walk.do_reject)
+                    result.then(on_resolve, reject_walk)
                     return True
                 results[response_name] = result
             return False
+
+        def reject_walk(error: Exception) -> None:
+            # Keep the located error's traceback down to the resolver.
+            walk.do_reject(error, False, error.__traceback__)
 
         def continue_from(index: int) -> None:
             try:
                 pending = execute_from(index)
             except Exception as error:
-                walk.do_reject(error)
+                reject_walk(error)
                 return
             if not pending:
                 walk.do_resolve(results)
