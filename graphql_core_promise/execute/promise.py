@@ -134,47 +134,56 @@ class PromiseExecutionContext(ExecutionContext):
         field fresh loaders, or the mutation clears the keys it writes (or clears
         them and then primes them with the new values: ``prime`` alone leaves a
         key that is already cached unchanged).
+
+        The fields are walked in a loop, not chained up front: plain values are
+        stored as the loop goes, and the first promise ends this pass. The rest
+        of the fields run in a new pass started from a fresh tick once that
+        promise settles. Chaining every later field as a ``then`` of the
+        previous one nested each plain-valued field inside the previous one's
+        callback whenever the chain descended from a ``Promise.all`` (whose
+        promises settle their callbacks synchronously and hand that on), about
+        six frames per field: a few hundred plain root fields after a payload
+        with two loader-backed fields overflowed the stack, and the
+        ``RecursionError``, swallowed by promise's scheduler, left the response
+        pending for good.
         """
         is_promise = self.is_promise
+        field_items = list(fields.items())
+        field_count = len(field_items)
+        results: dict[str, Any] = {}
 
-        def execute_one(
-            results: dict[str, Any],
-            response_name: str,
-            field_nodes: list[FieldNode],
-        ) -> PromiseOrValue[dict[str, Any]]:
-            field_path = Path(path, response_name, parent_type.name)
-            result = self.execute_field(
-                parent_type, source_value, field_nodes, field_path
-            )
-            if result is Undefined:
-                return results
-            if is_promise(result):
+        def execute_from(index: int) -> PromiseOrValue[dict[str, Any]]:
+            while index < field_count:
+                response_name, field_nodes = field_items[index]
+                index += 1
+                field_path = Path(path, response_name, parent_type.name)
+                result = self.execute_field(
+                    parent_type, source_value, field_nodes, field_path
+                )
+                if result is Undefined:
+                    continue
+                if is_promise(result):
+                    # noinspection PyShadowingNames
+                    def on_resolve(
+                        resolved: Any,
+                        response_name: str = response_name,
+                        next_index: int = index,
+                    ) -> PromiseOrValue[dict[str, Any]]:
+                        results[response_name] = resolved
+                        if next_index == field_count:
+                            return results
+                        # ``then`` on a settled promise that is not async-
+                        # guaranteed goes through the trampoline queue, so the
+                        # next pass starts on a flat stack.
+                        return Promise.resolve(None).then(
+                            lambda _: execute_from(next_index)
+                        )
 
-                def on_resolve(resolved: Any) -> dict[str, Any]:
-                    results[response_name] = resolved
-                    return results
-
-                return cast(Promise, result).then(on_resolve)
-            results[response_name] = result
+                    return cast(Promise, result).then(on_resolve)
+                results[response_name] = result
             return results
 
-        results: PromiseOrValue[dict[str, Any]] = {}
-        for response_name, field_nodes in fields.items():
-            if is_promise(results):
-                # noinspection PyShadowingNames
-                def execute_next(
-                    resolved_results: dict[str, Any],
-                    response_name: str = response_name,
-                    field_nodes: list[FieldNode] = field_nodes,
-                ) -> PromiseOrValue[dict[str, Any]]:
-                    return execute_one(resolved_results, response_name, field_nodes)
-
-                results = cast(Promise, results).then(execute_next)
-            else:
-                results = execute_one(
-                    cast(dict[str, Any], results), response_name, field_nodes
-                )
-        return results
+        return execute_from(0)
 
     def execute_field(
         self,

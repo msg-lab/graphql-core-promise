@@ -1,3 +1,4 @@
+import threading
 from concurrent.futures import Future
 from unittest.mock import MagicMock, call
 
@@ -708,3 +709,170 @@ def test_non_null_child_failure_in_a_later_non_null_payload_nulls_the_data():
     assert result.data is None
     assert _errors(result) == [("required failed", ["b", "required"])]
     assert order == [("resolve", "a"), ("resolve", "b")]
+
+
+# A payload whose sub-fields are two loader-backed promises completes through
+# ``Promise.all``, whose promises settle their callbacks synchronously and pass
+# that on down the chain. Followed by many root fields that complete without a
+# promise, a chain built up front nested each of them inside the previous one
+# and overflowed the stack after about 160 fields, and the swallowed
+# ``RecursionError`` left the response pending for good.
+
+LONG_ROOT_COUNT = 1000
+
+
+def _execute_bounded(schema, query, timeout=30):
+    """Run ``_execute`` in a thread so a response left pending fails the test."""
+    outcome = {}
+
+    def run():
+        try:
+            outcome["result"] = _execute(schema, query)
+        except BaseException as error:
+            outcome["error"] = error
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    assert not thread.is_alive(), "the mutation never returned"
+    if "error" in outcome:
+        raise outcome["error"]
+    return outcome["result"]
+
+
+def _batched_payload_schema(extra_fields):
+    class EchoLoader(DataLoader):
+        def batch_load_fn(self, keys):
+            return Promise.resolve(list(keys))
+
+    loader = EchoLoader()
+    payload = GraphQLObjectType(
+        "Payload",
+        {
+            "x": GraphQLField(GraphQLString, resolve=lambda *_: loader.load("x")),
+            "y": GraphQLField(GraphQLString, resolve=lambda *_: loader.load("y")),
+        },
+    )
+    return _mutation_schema({
+        "a": GraphQLField(payload, resolve=lambda *_: object()),
+        **extra_fields,
+    })
+
+
+def _aliases(prefix, selection, count=LONG_ROOT_COUNT):
+    return " ".join(f"{prefix}{i}: {selection}" for i in range(count))
+
+
+def test_many_plain_root_fields_after_a_batched_payload_all_resolve():
+    schema = _batched_payload_schema({
+        "plain": GraphQLField(GraphQLString, resolve=lambda *_: "plain"),
+    })
+    query = (
+        "mutation { a { x y } "
+        + _aliases("t", "__typename")
+        + " "
+        + _aliases("p", "plain")
+        + " }"
+    )
+
+    result = _execute_bounded(schema, query)
+
+    assert result.errors is None
+    expected_keys = (
+        ["a"]
+        + [f"t{i}" for i in range(LONG_ROOT_COUNT)]
+        + [f"p{i}" for i in range(LONG_ROOT_COUNT)]
+    )
+    assert list(result.data) == expected_keys
+    assert result.data["a"] == {"x": "x", "y": "y"}
+    assert result.data[f"t{LONG_ROOT_COUNT - 1}"] == "Mutation"
+    assert result.data[f"p{LONG_ROOT_COUNT - 1}"] == "plain"
+
+
+def test_many_raising_nullable_root_fields_after_a_batched_payload_are_located():
+    def fail(*_args):
+        msg = "nullable failed"
+        raise RuntimeError(msg)
+
+    schema = _batched_payload_schema({
+        "fail": GraphQLField(GraphQLString, resolve=fail),
+        "last": GraphQLField(GraphQLString, resolve=lambda *_: "last"),
+    })
+    query = "mutation { a { x y } " + _aliases("f", "fail") + " last }"
+
+    result = _execute_bounded(schema, query)
+
+    assert len(result.data) == LONG_ROOT_COUNT + 2
+    assert result.data["last"] == "last"
+    assert result.data["f0"] is None
+    assert len(result.errors) == LONG_ROOT_COUNT
+    assert sorted(error.path[0] for error in result.errors) == sorted(
+        f"f{i}" for i in range(LONG_ROOT_COUNT)
+    )
+
+
+def test_raising_non_null_root_after_many_plain_root_fields_nulls_the_data():
+    order = []
+
+    def fail(*_args):
+        msg = "required failed"
+        raise RuntimeError(msg)
+
+    schema = _batched_payload_schema({
+        "required": GraphQLField(GraphQLNonNull(GraphQLString), resolve=fail),
+        "after": GraphQLField(
+            GraphQLString, resolve=_recorded(order, "after", lambda *_: "after")
+        ),
+    })
+    query = "mutation { a { x y } " + _aliases("t", "__typename") + " required after }"
+
+    result = _execute_bounded(schema, query)
+
+    assert result.data is None
+    assert _errors(result) == [("required failed", ["required"])]
+    assert order == []
+
+
+def test_many_batched_payload_root_fields_resolve_in_document_order():
+    order = []
+
+    class RecordingLoader(DataLoader):
+        def batch_load_fn(self, keys):
+            order.append(tuple(keys))
+            return Promise.resolve(list(keys))
+
+    loader = RecordingLoader()
+    payload = GraphQLObjectType(
+        "Payload",
+        {
+            "x": GraphQLField(
+                GraphQLString, resolve=lambda obj, _info: loader.load(f"{obj}.x")
+            ),
+            "y": GraphQLField(
+                GraphQLString, resolve=lambda obj, _info: loader.load(f"{obj}.y")
+            ),
+        },
+    )
+    schema = _mutation_schema({
+        "a": GraphQLField(
+            payload,
+            args={"n": GraphQLArgument(GraphQLString)},
+            resolve=lambda _obj, _info, n: Promise.resolve(n),
+        ),
+    })
+    query = (
+        "mutation { "
+        + " ".join(f'a{i}: a(n: "{i}") {{ x y }}' for i in range(LONG_ROOT_COUNT))
+        + " }"
+    )
+
+    result = _execute_bounded(schema, query)
+
+    assert result.errors is None
+    assert list(result.data) == [f"a{i}" for i in range(LONG_ROOT_COUNT)]
+    assert result.data[f"a{LONG_ROOT_COUNT - 1}"] == {
+        "x": f"{LONG_ROOT_COUNT - 1}.x",
+        "y": f"{LONG_ROOT_COUNT - 1}.y",
+    }
+    # One batch per root field, in document order: no field ran early.
+    assert order == [(f"{i}.x", f"{i}.y") for i in range(LONG_ROOT_COUNT)]
